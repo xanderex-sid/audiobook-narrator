@@ -173,6 +173,102 @@ class NarratorApp:
         self.player.resume()
         print(f'▶  resumed at {self._pos_str(self.player.position())} — press <Enter> to talk again')
 
+    # ── hands-free loop: 2 ENTERs per talk session, voice-only in between ──────
+    def run_handsfree(self, stt, tts):
+        """The full voice experience with minimal keys (WS-5).
+
+        PLAYING: the book plays aloud.
+          - press ENTER  -> pause and start a hands-free talking session
+          - press q ENTER -> quit
+        CONVERSING: talk by VOICE only — ask, hear the answer, ask again; the
+        narrator auto-listens between turns (no keys).
+          - press ENTER  -> stop talking and resume the book
+
+        So exactly two ENTERs per talking session (one in, one out), plus q to quit.
+        """
+        import threading
+        from . import paudio
+
+        if not paudio.available():
+            print("! No PulseAudio device — falling back to typed mode.")
+            self.drive(control.TextController().events_iter())
+            return
+
+        enter_evt = threading.Event()
+        quit_evt = threading.Event()
+
+        def watch_stdin():
+            while not quit_evt.is_set():
+                try:
+                    line = input()
+                except (EOFError, KeyboardInterrupt):
+                    quit_evt.set()
+                    return
+                if line.strip().lower() in ("q", "quit", "exit"):
+                    quit_evt.set()
+                    return
+                enter_evt.set()  # any other ENTER = toggle talk/resume
+
+        threading.Thread(target=watch_stdin, daemon=True).start()
+
+        self.player.play()
+        print(f"\n▶  playing — {self._pos_str(self.player.position())}")
+        print("   Press ENTER to talk (book pauses) · ENTER again to resume · q ENTER to quit")
+        print("   While talking, just SPEAK — the narrator listens automatically between answers.\n")
+
+        state = "PLAYING"
+        while not quit_evt.is_set():
+            if state == "PLAYING":
+                if enter_evt.wait(timeout=0.2):
+                    enter_evt.clear()
+                    pos = self.player.pause()
+                    self.session = NarratorSession(self.manifest, pos)
+                    print(f"\n⏸  paused at {self._pos_str(pos)} — talking mode (speak; ENTER to resume)")
+                    if self.session.memory_context:
+                        print("   (remembering earlier sessions)")
+                    self.speak("Yes?")
+                    state = "CONVERSING"
+                continue
+
+            # CONVERSING — hands-free voice turns until ENTER or quit
+            if enter_evt.is_set() or quit_evt.is_set():
+                enter_evt.clear()
+                self.speak("Okay.")
+                time.sleep(_RESUME_PAUSE_SEC)
+                self._resume_handsfree()
+                state = "PLAYING"
+                continue
+
+            print("   🎙️  listening…", flush=True)
+            audio = paudio.record_utterance(
+                should_stop=lambda: enter_evt.is_set() or quit_evt.is_set(),
+                on_start=lambda: print("   …hearing you", flush=True),
+            )
+            if enter_evt.is_set() or quit_evt.is_set():
+                continue  # ENTER pressed mid-listen -> loop back, will resume
+            text, ok = stt.transcribe_checked(audio)
+            if not ok or not text:
+                continue  # silence / hallucination -> just keep listening (WS-7)
+            print(f"  you> {text}")
+            resp, note = self.session.handle(text)
+            tag = "  [spoiler revealed]" if resp.spoiler_used else ""
+            self.speak(resp.speech_text + tag)
+            if note:
+                print(f"   {note}  →  resume now {self._pos_str(self.session.pos)}")
+
+        if self.session:
+            self.session.end()
+        self.player.pause()
+        print("\n■  stopped. Progress and notes saved.")
+
+    def _resume_handsfree(self):
+        resume_pos = self.session.pos
+        self.session.end()
+        self.session = None
+        self.player.seek_to(resume_pos)
+        self.player.resume()
+        print(f"▶  resumed at {self._pos_str(self.player.position())} — ENTER to talk again")
+
 
 # ── scripted demo (verifiable, no hardware) ──────────────────────────────────
 def _demo(manifest) -> int:
@@ -211,11 +307,14 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description="Audiobook Narrator — full loop")
+    ap.add_argument("--listen", action="store_true",
+                    help="hands-free voice: ENTER to talk, ENTER to resume, q to quit")
     ap.add_argument("--demo", action="store_true", help="run the scripted demo")
     ap.add_argument("--text", action="store_true", help="drive live by typing")
-    ap.add_argument("--voice", action="store_true", help="drive by microphone (needs PortAudio)")
-    ap.add_argument("--chapter", type=int, default=2)
-    ap.add_argument("--offset", type=float, default=0.4, help="fraction 0..1 into the chapter")
+    ap.add_argument("--voice", action="store_true", help="push-to-talk voice (legacy)")
+    ap.add_argument("--chapter", type=int, default=None, help="start chapter (default: from the beginning / resume)")
+    ap.add_argument("--offset", type=float, default=None, help="fraction 0..1 into the chapter")
+    ap.add_argument("--resume", action="store_true", help="resume where you left off instead of the start")
     ap.add_argument("--no-audio", action="store_true", help="don't open a speaker device")
     args = ap.parse_args(argv)
 
@@ -227,8 +326,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         return _demo(manifest)
 
-    dur = next(c["duration_sec"] for c in manifest["chapters"] if c["index"] == args.chapter)
-    start = PlaybackPosition(args.chapter, dur * args.offset)
+    # Starting position: explicit args win; else resume (if asked); else the very start.
+    if args.chapter is not None or args.offset is not None:
+        ch = args.chapter or 1
+        dur = next(c["duration_sec"] for c in manifest["chapters"] if c["index"] == ch)
+        start = PlaybackPosition(ch, dur * (args.offset if args.offset is not None else 0.0))
+    elif args.resume:
+        from . import memory
+        start = memory.get_resume_position() or PlaybackPosition(1, 0.0)
+    else:
+        start = PlaybackPosition(1, 0.0)   # from the beginning
+
+    if args.listen:
+        from . import voice
+
+        app = NarratorApp(manifest, start, speak=_make_voice_speak(), audio=not args.no_audio)
+        app.run_handsfree(voice.STT(), voice.TTS())
+        return 0
 
     if args.voice:
         from . import voice

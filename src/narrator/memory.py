@@ -22,15 +22,19 @@ from .position import PlaybackPosition
 _LONGTERM = config.SESSIONS_DIR / "memory.json"
 _MAX_SUMMARIES = 6          # keep the last N session summaries
 _SUMMARIES_IN_CONTEXT = 3   # how many to feed into a new session
+_MAX_ITEMS = 300            # cap embedded memory items (WS-8)
+_RECALL_K = 3               # semantic hits injected per turn
 
 
 def _load_longterm() -> dict:
     if _LONGTERM.exists():
         try:
-            return json.loads(_LONGTERM.read_text(encoding="utf-8"))
+            d = json.loads(_LONGTERM.read_text(encoding="utf-8"))
+            d.setdefault("items", [])
+            return d
         except json.JSONDecodeError:
             pass
-    return {"resume_position": None, "session_summaries": []}
+    return {"resume_position": None, "session_summaries": [], "items": []}
 
 
 def _save_longterm(d: dict) -> None:
@@ -61,6 +65,59 @@ def recent_context(n: int = _SUMMARIES_IN_CONTEXT) -> str:
         return ""
     lines = [f"- {s['summary']}" for s in summaries]
     return "Notes from earlier sessions with this listener:\n" + "\n".join(lines)
+
+
+# ── WS-8: semantic cross-session recall (local embeddings) ─────────────────────
+def _cosine(a: list[float], b: list[float]) -> float:
+    import math
+
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return dot / (na * nb)
+
+
+def _store_items(texts: list[str]) -> None:
+    """Embed and append memory items (best-effort; silent if embeddings are down)."""
+    texts = [t.strip() for t in texts if t and t.strip()]
+    if not texts:
+        return
+    try:
+        embs = llm.embed(texts)
+    except llm.LLMError:
+        return
+    d = _load_longterm()
+    now = time.time()
+    for t, e in zip(texts, embs):
+        d["items"].append({"text": t, "ts": now, "emb": e})
+    d["items"] = d["items"][-_MAX_ITEMS:]
+    _save_longterm(d)
+
+
+def semantic_recall(query: str, k: int = _RECALL_K) -> list[str]:
+    """Return up to k past memory items most relevant to `query` (or [])."""
+    d = _load_longterm()
+    items = d.get("items", [])
+    if not items or not query.strip():
+        return []
+    try:
+        q = llm.embed([query])[0]
+    except llm.LLMError:
+        return []
+    scored = sorted(items, key=lambda it: _cosine(q, it.get("emb", [])), reverse=True)
+    return [it["text"] for it in scored[:k]]
+
+
+def turn_context(query: str) -> str:
+    """Per-turn memory block: recent-session continuity + semantic hits for this query."""
+    parts = []
+    recent = recent_context()
+    if recent:
+        parts.append(recent)
+    hits = semantic_recall(query)
+    if hits:
+        parts.append("Relevant things this listener said before:\n" + "\n".join(f"- {h}" for h in hits))
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -120,3 +177,6 @@ class SessionLog:
                 "position_sec": resume_pos.position_sec,
             }
         _save_longterm(d)
+        # WS-8: embed this session's listener asks + summary for future semantic recall.
+        asks = [t["text"] for t in self.turns if t["role"] == "listener"]
+        _store_items(asks + ([summary] if summary else []))

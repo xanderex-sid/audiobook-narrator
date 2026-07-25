@@ -72,43 +72,49 @@ match your audio (the committed `data/book_manifest.json` matches the original r
 ./scripts/narrate.sh --rebuild --chapter 1        # or: python -m narrator.corpus
 ```
 
-## Quick start
+## Quick start — the one command
+
 ```bash
-# 1. Start the local LLM (model store stays inside the project)
-./scripts/serve.sh          # leave running, or the other scripts auto-start it
+./scripts/listen.sh          # 🎧 start the audiobook from the beginning and talk to it
+```
+Use **headphones**. Then:
+- **ENTER** → pauses the book and starts a talking session — now just **speak**; the
+  narrator listens automatically between answers (no keys per turn).
+- **ENTER** again → stops talking and resumes the audiobook where you left off.
+- **q** then ENTER → quit.
 
-# 2a. Text brain — set where you are, then ask (no audio needed)
-./scripts/narrate.sh --chapter 2 --offset 50%
+So exactly **two ENTERs per talking session**, voice-only in between. It auto-starts the
+local LLM and builds the manifest if needed. `./scripts/listen.sh --resume` continues
+where you last stopped instead of the start.
 
-# 2b. Full loop, scripted demo — play → "Hey Narrator" → Q&A → resume
-./scripts/demo.sh
-
-# 2c. Speech round-trip check (TTS → STT)
-./scripts/voice-selftest.sh --selftest
-
-# 2d. Live full loop, SPEAK to it (real mic + speaker via WSLg)
-./scripts/voice.sh --voice --chapter 2 --offset 0.4
-#   While the book plays:  press [Enter] to talk (pauses the book)
-#   Then: press [Enter] to start recording, speak, press [Enter] to send
-#   Ask anything; say/type "ok continue story" (or 'c') to resume; 'q' to quit
-#   (You can also type questions instead of speaking.)
-
-# 2e. Type-driven full loop (no mic needed)
-./scripts/voice.sh --text --chapter 2
+### Other entry points
+```bash
+./scripts/serve.sh                              # start the local LLM only (auto-started otherwise)
+./scripts/narrate.sh --chapter 2 --offset 50%   # text brain — type questions, no audio
+./scripts/align.sh                              # build exact spoiler cutoff + phrase-restart (one-time)
+./scripts/preferences.sh --from-chapter 3       # write the generator preference JSON
+./scripts/voice-selftest.sh --selftest          # TTS → STT round-trip check
+./scripts/demo.sh                               # scripted full-loop demo (no mic)
 ```
 
 ## What it does (verified)
-- **Spoiler gate** — answers use only what you've heard (position → text via
-  proportional-by-time). "What's the third wish?" mid-book is refused; "I don't care
-  about spoilers, tell me the ending" reveals it. Consent is detected
-  deterministically so a plain question can never leak.
-- **Q&A / recaps / meanings** grounded in the heard portion; the brain ignores its own
-  prior knowledge of the story.
-- **Navigation** — "skip to chapter 3", "go to chapter 2" move playback and update the
-  resume point.
-- **Memory** — remembers past sessions (summaries) and resumes where you left off
-  (`data/sessions/`).
-- **Voice** — spoken question → transcript → spoken answer, all local.
+- **Hands-free talk** — press ENTER once, then converse entirely by voice (auto
+  endpointing); ENTER again resumes. Two ENTERs per session, nothing else.
+- **Tool-calling brain** — every capability (answer, recap, summarize, where-am-I,
+  goto/skip/restart-from-a-quoted-line, set-resume) is an explicit LLM tool.
+- **Spoiler gate with warn→confirm** — a spoiler question is never answered outright;
+  the narrator warns ("that's a spoiler, you'll find it in Chapter N — sure?") and only
+  reveals after you confirm. Consent is deterministic; three independent, leak-proof
+  signals decide what's a spoiler. "I don't care, tell me the ending" reveals directly.
+- **Exact position** — forced alignment (faster-whisper word timestamps) maps time↔text,
+  so the cutoff lands on real sentence boundaries and "restart from '<line>'" is exact.
+- **Any book** — auto-detects chapter markers (Roman/`Chapter N`/`N.`/markdown) and
+  supports a single combined audiobook wav, not just this story.
+- **Semantic memory** — recalls relevant things you asked in earlier sessions (local
+  embeddings), and resumes where you left off.
+- **Preference handoff** — infers your vocabulary/pacing preferences and writes JSON for
+  a downstream audiobook generator (`data/preferences/`).
+- **Fully local** — LLM, STT, TTS, embeddings all on-device.
 
 ## Architecture
 Independent blocks in `src/narrator/`: `corpus`(B0) · `player`/`playback`(B1) ·

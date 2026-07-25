@@ -47,6 +47,15 @@ def _hf_snapshot(repo: str) -> Path:
     raise FileNotFoundError(f"No local snapshot for {repo} under {snaps}")
 
 
+# Whisper's classic empty-audio hallucinations — rejected when they arrive alone
+# on near-silent input (WS-7).
+_HALLUCINATIONS = {
+    "thank you.", "thank you", "thanks for watching.", "thanks for watching",
+    "you", "you.", ".", "bye.", "bye", "so", "okay.", "please subscribe.",
+    "thank you for watching.", "i'm sorry.",
+}
+
+
 # ── STT ──────────────────────────────────────────────────────────────────────
 class STT:
     def __init__(self):
@@ -64,10 +73,58 @@ class STT:
 
     def transcribe(self, audio) -> str:
         """audio: a wav path (str/Path) or a float32 mono 16k numpy array."""
+        text, _ok = self.transcribe_checked(audio)
+        return text
+
+    def transcribe_checked(self, audio) -> tuple[str, bool]:
+        """Transcribe and judge whether it's a real utterance (WS-7).
+
+        Returns (text, ok). ok=False for near-silent input or a lone classic
+        hallucination (e.g. "Thank you." on empty audio), so the caller can drop
+        phantom questions instead of answering them.
+        """
+        import numpy as np
+
         model = self._load()
         src = str(audio) if isinstance(audio, (str, Path)) else audio
-        segments, _info = model.transcribe(src, language="en", beam_size=1)
-        return "".join(seg.text for seg in segments).strip()
+
+        # Energy gate for in-memory arrays: reject near-silence outright.
+        if not isinstance(audio, (str, Path)):
+            arr = np.asarray(audio, dtype="float32")
+            if arr.size < 1600 or float(np.sqrt(np.mean(arr ** 2))) < 0.006:
+                return "", False
+
+        # vad_filter drops non-speech regions -> far fewer silence hallucinations.
+        segments, _info = model.transcribe(
+            src, language="en", beam_size=1,
+            vad_filter=True, vad_parameters={"min_silence_duration_ms": 500},
+        )
+        segs = list(segments)
+        text = "".join(s.text for s in segs).strip()
+        if not text:
+            return "", False
+
+        # Reject a lone classic hallucination or low-confidence single token.
+        low = text.lower().strip()
+        avg_logprob = sum(getattr(s, "avg_logprob", 0.0) for s in segs) / max(1, len(segs))
+        no_speech = max((getattr(s, "no_speech_prob", 0.0) for s in segs), default=0.0)
+        if low in _HALLUCINATIONS and (no_speech > 0.5 or avg_logprob < -0.8):
+            return "", False
+        if no_speech > 0.85:
+            return "", False
+        return text, True
+
+    def transcribe_words(self, wav_path) -> list[tuple[str, float, float]]:
+        """Word-level timestamps for forced alignment (WS-4): [(word, start, end), ...]."""
+        model = self._load()
+        segments, _info = model.transcribe(
+            str(wav_path), language="en", beam_size=1, word_timestamps=True
+        )
+        words: list[tuple[str, float, float]] = []
+        for seg in segments:
+            for w in (seg.words or []):
+                words.append((w.word, float(w.start), float(w.end)))
+        return words
 
 
 # ── TTS ──────────────────────────────────────────────────────────────────────

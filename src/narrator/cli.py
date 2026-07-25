@@ -47,7 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.rebuild or not corpus.config.MANIFEST_PATH.exists():
-        corpus.save_manifest(corpus.build_manifest())
+        chapters, single = corpus.build_manifest()
+        corpus.save_manifest(chapters, single_file=single)
     manifest = corpus.load_manifest()
 
     if not llm.is_up():

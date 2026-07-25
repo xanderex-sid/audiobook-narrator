@@ -125,18 +125,29 @@ def stop_recording(proc: "subprocess.Popen") -> None:
 def record_utterance(
     max_sec: float = 15.0,
     silence_sec: float = 1.0,
-    start_timeout_sec: float = 6.0,
+    start_timeout_sec: float = 8.0,
     threshold: float = 0.012,
+    tail_pad_sec: float = 0.4,
+    should_stop=None,
+    on_start=None,
 ):
     """Capture one spoken utterance from the mic. Returns float32 mono 16k array.
 
-    Waits (up to start_timeout_sec) for speech to begin, then records until
-    `silence_sec` of quiet. Returns an empty-ish array if nothing was said.
+    Hands-free: waits (up to start_timeout_sec) for speech, then records until
+    `silence_sec` of quiet, keeping `tail_pad_sec` of trailing audio so the last
+    word isn't clipped (WS-7).
+
+    `should_stop()` is polled each 50ms frame; if it returns True the capture
+    aborts and returns whatever was heard (used so a keypress can interrupt
+    listening). `on_start()` fires once when speech is first detected.
+
+    Returns an empty-ish array if nothing was said (or aborted before speech).
     """
     import numpy as np
 
     sr = 16000
     chunk = int(sr * 0.05)  # 50ms frames
+    pad_frames = int(tail_pad_sec / 0.05)
     cmd = [PAREC, "--format=s16le", f"--rate={sr}", "--channels=1", "--latency-msec=30"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -147,6 +158,8 @@ def record_utterance(
     bytes_per = chunk * 2
     try:
         while True:
+            if should_stop is not None and should_stop():
+                break
             buf = proc.stdout.read(bytes_per)
             if not buf or len(buf) < bytes_per:
                 break
@@ -156,6 +169,8 @@ def record_utterance(
                 waited += 0.05
                 if rms >= threshold:
                     speaking = True
+                    if on_start is not None:
+                        on_start()
                     frames.append(arr)
                 elif waited >= start_timeout_sec:
                     break
@@ -164,6 +179,12 @@ def record_utterance(
             silent = silent + 0.05 if rms < threshold else 0.0
             total = len(frames) * 0.05
             if silent >= silence_sec and total > 0.4:
+                # keep a little trailing audio, then stop
+                for _ in range(pad_frames):
+                    extra = proc.stdout.read(bytes_per)
+                    if not extra or len(extra) < bytes_per:
+                        break
+                    frames.append(np.frombuffer(extra, dtype="<i2").astype("float32") / 32768.0)
                 break
             if total >= max_sec:
                 break

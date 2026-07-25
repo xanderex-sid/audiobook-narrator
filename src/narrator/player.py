@@ -49,10 +49,18 @@ class AudioPlayer:
                 return ch["audio_path"]
         return ""
 
+    def _audio_start(self, idx: int) -> float:
+        """Offset of this chapter inside its wav (nonzero for single-file books)."""
+        for ch in self.manifest["chapters"]:
+            if ch["index"] == idx:
+                return float(ch.get("audio_start_sec", 0.0))
+        return 0.0
+
     def _start_audio(self):
         if not self._audio or self._book is None:
             return
-        self._book.start(self._audio_path(self.pos.chapter_index), self._base)
+        idx = self.pos.chapter_index
+        self._book.start(self._audio_path(idx), self._audio_start(idx) + self._base)
 
     def _stop_audio(self):
         if self._book is not None:

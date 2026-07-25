@@ -20,6 +20,7 @@ class NarratorSession:
         self.pos = playback.clamp(manifest, start_pos)
         self.log = memory.SessionLog()
         self.memory_context = memory.recent_context()
+        self.pending_spoiler: dict | None = None   # WS-2 warn-then-confirm state
 
     # ── introspection ────────────────────────────────────────────────────────
     def cutoff(self):
@@ -39,13 +40,18 @@ class NarratorSession:
         cutoff = self.cutoff()
         self.log.add("listener", query)
 
+        # Per-turn memory: recent-session continuity + semantic recall for THIS query.
+        mem = memory.turn_context(query) or self.memory_context
+
         resp = agent.respond(
             self.manifest,
             query,
             self.pos,
             cutoff,
-            memory_context=self.memory_context,
+            memory_context=mem,
+            pending_spoiler=self.pending_spoiler,
         )
+        self.pending_spoiler = resp.pending_spoiler  # carry warn->confirm across turns
         self.log.add("narrator", resp.speech_text)
 
         new_pos, note = playback.apply_action(self.manifest, self.pos, resp.action)
@@ -55,5 +61,10 @@ class NarratorSession:
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def end(self) -> None:
-        """Persist the session summary and where to resume next time."""
+        """Persist the session summary + resume point, and refresh preferences."""
         self.log.end(resume_pos=self.pos)
+        try:
+            from . import preferences
+            preferences.generate(applies_from_chapter=self.pos.chapter_index + 1)
+        except Exception:
+            pass  # preferences are a nicety; never fail a session over them
