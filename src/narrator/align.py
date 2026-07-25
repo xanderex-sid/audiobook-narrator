@@ -37,36 +37,42 @@ def _clean(word: str) -> str:
 
 
 def align_chapter(chapter: dict, stt) -> dict | None:
-    """Build the checkpoint map for one chapter. Returns the payload or None."""
+    """Build the checkpoint map for one chapter. Returns the payload or None.
+
+    Aligns the SPOKEN transcript (word + timestamp) to the book TEXT with a proper
+    subsequence alignment (difflib), not a greedy forward scan — the greedy version
+    raced ahead on common words and compressed the whole map into the first third of
+    the audio. Each matched run contributes monotonic [time_sec, char_offset] points.
+    """
     words = stt.transcribe_words(chapter["audio_path"])
     if not words:
         return None
 
-    toks = _text_tokens(chapter["text"])
+    toks = _text_tokens(chapter["text"])          # [(token, char_offset), ...]
     if not toks:
         return None
 
+    # spoken tokens with their start times (drop empties)
+    spoken = [(_clean(raw), float(start)) for raw, start, _end in words if _clean(raw)]
+    if not spoken:
+        return None
+    dg_seq = [w for w, _ in spoken]
+    bk_seq = [t for t, _ in toks]
+
+    # autojunk=False so frequent words ("the", "a") still anchor the alignment.
+    sm = SequenceMatcher(None, dg_seq, bk_seq, autojunk=False)
     points: list[list[float]] = [[0.0, 0]]
-    ti = 0                      # pointer into text tokens
-    window = 40                 # how far ahead to search for a match (STT drift)
-    for raw, start, _end in words:
-        w = _clean(raw)
-        if not w:
+
+    def add(t: float, c: int) -> None:
+        if t >= points[-1][0] and c >= points[-1][1]:
+            points.append([round(t, 3), int(c)])
+
+    for a, b, size in sm.get_matching_blocks():
+        if size == 0:
             continue
-        best_j, best_score = -1, 0.0
-        for j in range(ti, min(ti + window, len(toks))):
-            tok = toks[j][0]
-            if tok == w:
-                best_j, best_score = j, 1.0
-                break
-            score = SequenceMatcher(None, w, tok).ratio()
-            if score > best_score:
-                best_j, best_score = j, score
-        if best_j >= 0 and best_score >= 0.8:
-            char_off = toks[best_j][1]
-            if char_off >= points[-1][1]:      # enforce monotonic
-                points.append([round(start, 3), char_off])
-            ti = best_j + 1
+        add(spoken[a][1], toks[b][1])                       # start of the matched run
+        if size > 8:                                        # and the end of a long run
+            add(spoken[a + size - 1][1], toks[b + size - 1][1])
 
     points.append([float(chapter["duration_sec"]), int(chapter["char_count"])])
 
@@ -86,7 +92,7 @@ def align_chapter(chapter: dict, stt) -> dict | None:
 
 
 def run(chapter_index: int | None = None) -> int:
-    from .voice import STT
+    from . import voice
 
     manifest = corpus.load_manifest()
     if manifest.get("single_file"):
@@ -95,7 +101,10 @@ def run(chapter_index: int | None = None) -> int:
         return 0
 
     config.ALIGNMENT_DIR.mkdir(parents=True, exist_ok=True)
-    stt = STT()
+    # Backend-aware: cloud uses Deepgram word timestamps (accurate), local uses
+    # faster-whisper. The map is what makes find_phrase / spoiler cutoff land exactly.
+    stt = voice.make_stt()
+    print(f"[align backend: {config.BACKEND}]")
     done = 0
     for ch in manifest["chapters"]:
         if chapter_index and ch["index"] != chapter_index:

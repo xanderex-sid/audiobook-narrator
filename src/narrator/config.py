@@ -78,6 +78,13 @@ WAKE_WORDS = [w.strip().lower() for w in
               os.environ.get("NARRATOR_WAKE_WORD", "friday").split(",") if w.strip()]
 RESUME_WORDS = [w.strip().lower() for w in
                 os.environ.get("NARRATOR_RESUME_WORD", "continue,resume").split(",") if w.strip()]
+# In wake mode, finalize a spoken turn only after this many seconds of silence, so a
+# mid-thought pause doesn't cut you off (any speech resets it). Override via env.
+WAKE_SILENCE_SEC = float(os.environ.get("NARRATOR_WAKE_SILENCE", "1.5"))
+
+# Fresh session: ignore all prior memory/history and don't persist this run. Set by
+# `--fresh` (or $NARRATOR_FRESH). Non-destructive — saved data on disk is untouched.
+FRESH = bool(os.environ.get("NARRATOR_FRESH", ""))
 
 # ── Local Ollama (used for `local` backend, and always for memory embeddings) ──
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")

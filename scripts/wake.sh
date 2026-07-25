@@ -8,6 +8,11 @@
 #   Press  q ENTER             -> quit
 #
 # Wake/resume words are configurable: NARRATOR_WAKE_WORD / NARRATOR_RESUME_WORD.
+# Pause length before it answers: NARRATOR_WAKE_SILENCE (default 1.5s).
+#
+#   ./scripts/wake.sh --fresh   # start with ZERO prior memory/history, save nothing
+#                               # (non-destructive: your saved data on disk is kept)
+#
 # Cloud backend only (Deepgram streaming). Keys load from ./.env.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

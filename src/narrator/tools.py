@@ -39,7 +39,7 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "recap",
             "description": (
                 "Give a recap/'remind me' of the story so far, optionally focused on a "
-                "character or thread (e.g. 'remind me who Herbert is', 'recap so far')."
+                "character or thread (e.g. 'remind me who that character is', 'recap so far')."
             ),
             "parameters": {
                 "type": "object",
@@ -95,13 +95,14 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "restart_from_phrase",
             "description": (
-                "Resume the audiobook from a specific line the listener quotes, e.g. "
-                "'restart from \"be careful what you wish for\"'. Finds that line and "
-                "moves the resume point to it."
+                "Resume the audiobook from a specific spot the listener names — either a "
+                "quoted line (e.g. 'restart from \"be careful what you wish for\"') OR a "
+                "described moment (e.g. 'play from where the soldier arrives at the door'). "
+                "Finds that spot and moves the resume point to it."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"phrase": {"type": "string", "description": "the quoted words to find in the story"}},
+                "properties": {"phrase": {"type": "string", "description": "the quoted words OR a description of the moment to jump to"}},
                 "required": ["phrase"],
             },
         },
@@ -138,21 +139,28 @@ TOOL_SCHEMAS: list[dict] = [
 TOOL_NAMES = {t["function"]["name"] for t in TOOL_SCHEMAS}
 
 _ROUTER_SYSTEM = """\
-You route what a listener of the audiobook "{title}" just said to EXACTLY ONE \
-tool by making a tool call. Do not answer the question yourself; do not write \
-prose. Pick the single best tool and fill its arguments.
+You route what a listener of the audiobook "{title}" just said to tool calls. Do \
+not answer the question yourself; do not write prose. Pick the best tool(s) and \
+fill their arguments.
+
+Usually the listener wants ONE thing -> make ONE tool call. But if they clearly \
+ask for MORE THAN ONE thing in the same breath (e.g. "recap chapter 1 AND move to \
+chapter 2"), make ONE tool call for EACH distinct request, in the order they should \
+happen (information/recap first, navigation last). Do not invent extra calls.
 
 Guidance:
 - Questions about characters, plot, meanings, or the setting -> answer_about_story.
 - "recap", "remind me", "who is X again" -> recap.
 - "summarize chapter N" -> summarize_chapter.
 - "where are we", "what's happening now" -> where_am_i.
-- "go to / jump to / restart chapter N", "go back to chapter N" -> goto_chapter.
+- "go to / jump to / restart chapter N", "go back to chapter N", "move on to chapter N" -> goto_chapter.
 - "skip this chapter", "skip ahead" -> skip_chapter.
-- "restart from '<line>'", quoting words to jump to -> restart_from_phrase.
+- "restart from '<line>'", or "play/continue/start from where <something happens>" \
+(a quoted line OR a described moment) -> restart_from_phrase, with the quote or the \
+description as `phrase`.
 - "resume at chapter N, M seconds" -> set_resume_position.
 - greetings/thanks -> smalltalk.
-Never refuse. Never reveal plot beyond the question. Always call one tool.
+Never refuse. Never reveal plot beyond the question. Always call at least one tool.
 """
 
 

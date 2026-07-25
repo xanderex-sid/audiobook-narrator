@@ -81,6 +81,24 @@ def matches_keyword(text: str, words) -> bool:
     return False
 
 
+# A resume word riding along with another request ("continue FROM the phrase where…",
+# "resume AT chapter 2") must NOT be treated as a bare "resume the book" command — it
+# should route to the agent (restart_from_phrase / navigation) instead.
+_RESUME_OTHER_INTENT = (
+    "from", "phrase", "where", "chapter", "part", "scene", "line", "beginning",
+    "go to", "go back", "restart", "jump", "skip", "summar", "recap",
+    "what", "who", "how", "why", "which", "when", "explain", "?",
+)
+
+
+def is_resume_command(text: str, words) -> bool:
+    """True only for a BARE 'resume the book' command (no other request attached)."""
+    if not matches_keyword(text, words):
+        return False
+    joined = " ".join(_norm(text))
+    return not any(k in joined for k in _RESUME_OTHER_INTENT)
+
+
 @dataclass
 class Event:
     kind: str

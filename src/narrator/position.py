@@ -20,6 +20,7 @@ HeardCutoff      { chapter_index, char_offset, heard_text, unheard_exists }
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -129,27 +130,35 @@ def _norm(s: str) -> str:
     return " ".join(s.lower().split())
 
 
+def _tokens(s: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", s.lower())
+
+
 def find_phrase(manifest: dict, phrase: str) -> tuple[PlaybackPosition | None, float]:
     """Locate a quoted line in the book. Returns (position, confidence 0..1).
 
-    Exact (normalized) substring match wins; otherwise a fuzzy sliding-window
-    match over each chapter. The char offset is converted to a timestamp via
-    alignment when available, else proportionally.
+    1) EXACT word-sequence match over the RAW text, tolerant of punctuation, extra
+       whitespace, and case (so "paw dried" matches "paw, dried"). This returns the
+       TRUE character offset -> an accurate timestamp (no proportional drift).
+    2) Otherwise a fuzzy sliding-window match. The char offset is converted to a
+       timestamp via alignment when available, else proportionally.
     """
-    needle = _norm(phrase)
-    if not needle:
+    toks = _tokens(phrase)
+    if not toks:
         return None, 0.0
 
+    # 1) exact: allow any non-word chars (spaces, commas, quotes, newlines) between words
+    pattern = re.compile(r"\W+".join(re.escape(t) for t in toks), re.IGNORECASE)
+    for ch in manifest["chapters"]:
+        m = pattern.search(ch["text"])
+        if m:
+            return PlaybackPosition(ch["index"], char_to_time(ch, m.start())), 1.0
+
+    # 2) fuzzy: slide a window the size of the needle across each chapter (raw offsets)
+    needle = _norm(phrase)
     best_ch, best_off, best_score = None, 0, 0.0
     for ch in manifest["chapters"]:
         hay = ch["text"]
-        hay_norm = _norm(hay)
-        # exact normalized substring -> map back to an approx char offset in raw text
-        j = hay_norm.find(needle)
-        if j != -1:
-            off = int(round(len(hay) * j / max(1, len(hay_norm))))
-            return PlaybackPosition(ch["index"], char_to_time(ch, off)), 1.0
-        # fuzzy: slide a window the size of the needle across the chapter
         w = max(len(needle), 12)
         step = max(1, w // 2)
         for i in range(0, max(1, len(hay) - w + 1), step):

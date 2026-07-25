@@ -75,12 +75,44 @@ def _has_other_intent(text: str) -> bool:
 
 
 def is_pure_confirmation(text: str) -> bool:
-    """A bare 'yes'/'go ahead' with no other request riding along."""
-    return is_affirmation(text) and not _has_other_intent(text)
+    """A bare 'yes'/'go ahead' with no other request AND no negation riding along.
+
+    The negation guard is critical: "okay, leave it" contains the affirm token "okay"
+    but is clearly a REFUSAL ("leave it"), and must never count as spoiler consent.
+    """
+    return is_affirmation(text) and not is_negation(text) and not _has_other_intent(text)
 
 
 def is_pure_negation(text: str) -> bool:
     return is_negation(text) and not _has_other_intent(text)
+
+
+# References to RECENTLY HEARD content — about the heard text by definition (never a
+# spoiler), even though a phrase like "the last lines" / "the last four lines" can fool
+# a chapter guess into pointing at the end of the book.
+# Direct references to the prior utterance / just-heard audio:
+_UTTERANCE_REF = (
+    "you just said", "you just read", "just said", "just read", "just now",
+    "say that again", "read that again", "repeat that", "repeat the last",
+    "rephrase that", "rephrase it", "what was that", "what did you just", "that last",
+)
+# A unit of text the listener can only be referring to in what they've HEARD ...
+_LINE_WORDS = ("line", "lines", "sentence", "sentences", "paragraph", "paragraphs",
+               "bit", "part", "parts")
+# ... when paired with a recency/position qualifier:
+_RECENT_QUALIFIERS = (
+    "last", "previous", "prior", "preceding", "before this", "before that", "just before",
+    "few", "couple", "recent", "these", "those", "this line", "that line", "earlier",
+)
+
+
+def is_about_recent(text: str) -> bool:
+    """True when the listener is asking about content they just heard (last N lines /
+    sentences, 'the lines before this', 'say that again', 'rephrase that')."""
+    t = " ".join(text.lower().split())
+    if any(p in t for p in _UTTERANCE_REF):
+        return True
+    return any(w in t for w in _LINE_WORDS) and any(q in t for q in _RECENT_QUALIFIERS)
 
 
 @dataclass
@@ -238,6 +270,30 @@ def _target_chapter(title, query, full_text):
         return None
 
 
+_RECENT_SYSTEM = """\
+You are "Narrator", helping someone LISTENING to "{title}". They just asked about the \
+LAST thing they heard — e.g. "what were the last lines?", "say that again", "rephrase \
+that more clearly". Below is the tail of what they have heard, ending EXACTLY where they \
+paused.
+
+Restate, rephrase, or explain the final sentence(s) clearly and simply, IN YOUR OWN \
+WORDS. Use only what is in the text; do NOT continue the story or add anything new. Keep \
+it short (1-3 sentences). Plain spoken text only — no preamble, labels, or JSON.
+"""
+
+
+def _answer_recent(title, query, heard):
+    """Rephrase/explain the tail of the heard text. Always answers from heard content
+    (no NEED_SPOILER escape) — a request about just-heard lines can't be a spoiler."""
+    tail = heard[-1500:]
+    system = _RECENT_SYSTEM.format(title=title)
+    user = f'Listener asked: "{query}"\n\nTHE LAST THING THEY HEARD (ends where they paused):\n...{tail}'
+    return llm.chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.2, num_predict=200,
+    ).strip()
+
+
 def _answer_full(title, query, full_text):
     system = _ANSWER_FULL_SYSTEM.format(title=title)
     user = f"Listener asked: \"{query}\"\n\nFULL STORY:\n{full_text}"
@@ -248,14 +304,17 @@ def _answer_full(title, query, full_text):
 
 
 # ── routing ────────────────────────────────────────────────────────────────────
-def _route(title: str, position_line: str, query: str) -> tuple[str, dict]:
-    """Pick one tool + args via native tool-calling; fall back to a keyword guess."""
+def _route(title: str, position_line: str, query: str) -> list[tuple[str, dict]]:
+    """Pick one OR MORE tools + args via native tool-calling (multi-intent aware);
+    fall back to a single keyword guess. Returns an ordered, de-duplicated list."""
     try:
         msg = llm.chat_tools(tools.router_messages(title, position_line, query),
                              tools.TOOL_SCHEMAS, temperature=0.0)
         calls = msg.get("tool_calls") or []
-        if calls:
-            fn = calls[0].get("function", {})
+        out: list[tuple[str, dict]] = []
+        seen: set[str] = set()
+        for c in calls:
+            fn = c.get("function", {})
             name = fn.get("name")
             args = fn.get("arguments") or {}
             if isinstance(args, str):
@@ -264,11 +323,14 @@ def _route(title: str, position_line: str, query: str) -> tuple[str, dict]:
                     args = json.loads(args)
                 except Exception:
                     args = {}
-            if name in tools.TOOL_NAMES:
-                return name, args
+            if name in tools.TOOL_NAMES and name not in seen:
+                out.append((name, args))
+                seen.add(name)
+        if out:
+            return out[:3]  # cap: a listener rarely means more than a couple of things
     except Exception:
         pass
-    return _keyword_route(query)
+    return [_keyword_route(query)]
 
 
 def _keyword_route(query: str) -> tuple[str, dict]:
@@ -293,6 +355,51 @@ def _keyword_route(query: str) -> tuple[str, dict]:
     return "answer_about_story", {"query": query}
 
 
+_LOCATE_SYSTEM = """\
+You are given the FULL text of a story and a listener's description of a moment they \
+want to jump to.
+
+Return ONLY JSON with THREE fields:
+{"who_or_what": "<identify the specific person/thing/event the description refers to, \
+using ALL the details>", "quote": "<a short EXACT verbatim string, ~5-12 words, copied \
+from the story at that moment>", "confidence": <0.0-1.0, how sure you are this is the \
+right specific moment>}
+
+Rules:
+- Identity comes FIRST and is decided by the STRONGEST clue — a person's role or \
+background (e.g. "served in India", "the son", "the wife") outweighs an incidental word \
+like "door" or "fire". Do not jump to a different character just because one small word \
+matches them.
+- Then find the EARLIEST place that person/event appears/acts as described, and copy the \
+exact words there (same spelling and punctuation; never paraphrase or invent).
+- If the description is vague, incomplete, garbled, nonsensical, or you are NOT confident \
+which moment it means, do NOT guess — return "quote": "" and a LOW confidence (below 0.5).
+
+Example of the identity rule: for "where the person described by their past occupation \
+comes to the door", identify who that occupation points to and use THEIR arrival — not a \
+different, later character who merely also appears at a door.
+"""
+
+
+def _locate_quote(description: str, full_text: str) -> str:
+    """Map a DESCRIBED moment ('where the soldier comes to the door') to an exact
+    verbatim quote from the text, so find_phrase can seek to it. '' if not found /
+    not confident."""
+    if not description.strip():
+        return ""
+    try:
+        out = llm.chat_json(
+            [{"role": "system", "content": _LOCATE_SYSTEM},
+             {"role": "user", "content": f'MOMENT: "{description}"\n\nSTORY:\n{full_text}'}],
+            temperature=0.0,
+        )
+        if float(out.get("confidence") or 0.0) < 0.55:
+            return ""   # the model isn't sure -> don't seek to a guessed spot
+        return (out.get("quote") or "").strip()
+    except Exception:
+        return ""
+
+
 def _nav(manifest, pos, tool, args):
     """Build (action, speech) for a navigation tool. No story content."""
     n = manifest["n_chapters"]
@@ -311,13 +418,33 @@ def _nav(manifest, pos, tool, args):
                 f"Got it — I'll resume at Chapter {ch}, {sec:.0f} seconds in.")
     if tool == "restart_from_phrase":
         phrase = (args.get("phrase") or "").strip()
+        _unclear = "I didn't catch where you'd like to start — could you say that again?"
+        # Too few words to be a real quote or description (e.g. a cut-off "start from")
+        # -> don't guess a spot.
+        if len(phrase.split()) < 3:
+            return {"type": "none"}, _unclear
         found, score = position.find_phrase(manifest, phrase)
+        # If it wasn't a verbatim quote (low confidence), it may be a DESCRIPTION —
+        # ask the LLM for the exact line, then seek to that.
+        if found is None or score < 0.9:
+            quote = _locate_quote(phrase, knowledge.full_context(manifest))
+            if quote:
+                f2, s2 = position.find_phrase(manifest, quote)
+                if f2 is not None and s2 >= 0.9:   # only accept a confident, exact hit
+                    found, score = f2, s2
+                elif score < 0.9:
+                    found = None
+            elif score < 0.9:
+                found = None
         if found is None:
-            return {"type": "none"}, "I couldn't find that line in the story — could you quote a bit more?"
+            return {"type": "none"}, _unclear
         title = next(c["title"] for c in manifest["chapters"] if c["index"] == found.chapter_index)
-        hedge = "" if score >= 0.99 else " (closest match I could find)"
-        return ({"type": "set_resume_position", "chapter": found.chapter_index, "position_sec": found.position_sec},
-                f"Found it in {title}{hedge} — I'll resume from there.")
+        action = {"type": "set_resume_position", "chapter": found.chapter_index, "position_sec": found.position_sec}
+        # Echo the listener's OWN words + the chapter — confirms what was heard and
+        # where it's going, without ever naming unheard plot (spoiler-safe either way).
+        words = phrase.split()
+        echo = " ".join(words[:14]) + ("…" if len(words) > 14 else "")
+        return action, f"Okay — {title}, from where you said: “{echo}”."
     return {"type": "none"}, "Okay."
 
 
@@ -365,17 +492,73 @@ def respond(
     # (e.g. "okay, skip to chapter 3") clears the pending spoiler and is routed
     # normally — it must never be mistaken for spoiler consent.
     if pending_spoiler:
+        # Negation is checked FIRST and wins — never risk revealing on a mixed
+        # signal like "okay, leave it". Only a clean yes reveals.
+        if is_pure_negation(query):
+            return AgentResponse("Okay, I'll keep it a secret for now.", intent="control",
+                                 tool="smalltalk", pending_spoiler=None)
         if is_pure_confirmation(query):
             speech = _answer_full(title, pending_spoiler["query"], knowledge.full_context(manifest))
             return AgentResponse(speech or "Here's what happens...", intent="spoiler",
                                  tool="reveal_spoiler", spoiler_used=True, pending_spoiler=None)
-        if is_pure_negation(query):
-            return AgentResponse("Okay, I'll keep it a secret for now.", intent="control",
-                                 tool="smalltalk", pending_spoiler=None)
         # anything else: drop the pending spoiler and treat as a fresh request.
 
-    tool, args = _route(title, position_line, query)
+    # ── recent-content requests are heard-text by definition, whatever tool they'd
+    # route to ("summarize the last five lines", "explain the lines before this",
+    # "rephrase that") -> answer from the heard tail, bypassing routing + spoiler gate.
+    if is_about_recent(query):
+        heard = knowledge.heard_context(cutoff)
+        return AgentResponse(_answer_recent(title, query, heard), tool="answer_about_story")
 
+    calls = _route(title, position_line, query)
+    return _dispatch(manifest, query, pos, cutoff, calls,
+                     title=title, chapter_title=chapter_title, memory_context=memory_context)
+
+
+def _dispatch(manifest, query, pos, cutoff, calls, *, title, chapter_title, memory_context):
+    """Run one or more routed tools. A single call goes straight to its handler.
+    Multiple calls (a genuine multi-intent utterance) run the INFORMATIONAL part
+    first, then a NAVIGATION part — so "recap chapter 1 and move to chapter 2" does
+    both. A spoiler warning short-circuits before any navigation happens."""
+    if not calls:
+        calls = [("answer_about_story", {"query": query})]
+
+    if len(calls) == 1:
+        tool, args = calls[0]
+        return _dispatch_one(manifest, query, pos, cutoff, tool, args,
+                             title=title, chapter_title=chapter_title, memory_context=memory_context)
+
+    nav = next(((n, a) for n, a in calls if n in _NAV_TOOLS), None)
+    info = next(((n, a) for n, a in calls if n not in _NAV_TOOLS and n != "smalltalk"), None)
+    small = next(((n, a) for n, a in calls if n == "smalltalk"), None)
+
+    speeches: list[str] = []
+    spoiler_used = False
+    used_tool = calls[0][0]
+    if info is not None:
+        r = _dispatch_one(manifest, query, pos, cutoff, info[0], info[1],
+                          title=title, chapter_title=chapter_title, memory_context=memory_context)
+        if r.needs_confirmation:
+            return r  # resolve the spoiler warning before doing anything else
+        if r.speech_text:
+            speeches.append(r.speech_text)
+        spoiler_used = r.spoiler_used
+        used_tool = info[0]
+    elif small is not None:
+        speeches.append(small[1].get("reply") or "Sure.")
+        used_tool = "smalltalk"
+
+    if nav is not None:
+        action, sp = _nav(manifest, pos, nav[0], nav[1])
+        if sp:
+            speeches.append(sp)
+        return AgentResponse(" ".join(speeches).strip() or "Okay.", action,
+                             intent="navigate", tool=nav[0], spoiler_used=spoiler_used)
+    return AgentResponse(" ".join(speeches).strip() or "Okay.", tool=used_tool, spoiler_used=spoiler_used)
+
+
+def _dispatch_one(manifest, query, pos, cutoff, tool, args, *, title, chapter_title, memory_context):
+    """Handle exactly one routed tool (routing done; spoiler gate applied here)."""
     # ── navigation / control / smalltalk: no story content ────────────────────
     if tool in _NAV_TOOLS:
         action, speech = _nav(manifest, pos, tool, args)
@@ -422,6 +605,7 @@ def respond(
                              needs_confirmation=True, pending_spoiler={"query": f"Summarize chapter {idx}."})
 
     # ── answer_about_story ────────────────────────────────────────────────────
+    # (recent-content requests are handled in respond() before routing.)
     # If the listener already consented in this utterance, reveal directly.
     if wants_spoiler(query) and cutoff.unheard_exists:
         speech = _answer_full(title, query, knowledge.full_context(manifest))

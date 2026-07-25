@@ -43,6 +43,8 @@ def _save_longterm(d: dict) -> None:
 
 
 def get_resume_position() -> PlaybackPosition | None:
+    if config.FRESH:
+        return None
     rp = _load_longterm().get("resume_position")
     if rp:
         return PlaybackPosition(int(rp["chapter_index"]), float(rp["position_sec"]))
@@ -60,6 +62,8 @@ def set_resume_position(pos: PlaybackPosition) -> None:
 
 def recent_context(n: int = _SUMMARIES_IN_CONTEXT) -> str:
     """Compact prior-session context to prepend to a new session (or '')."""
+    if config.FRESH:
+        return ""
     summaries = _load_longterm().get("session_summaries", [])[-n:]
     if not summaries:
         return ""
@@ -110,6 +114,8 @@ def semantic_recall(query: str, k: int = _RECALL_K) -> list[str]:
 
 def turn_context(query: str) -> str:
     """Per-turn memory block: recent-session continuity + semantic hits for this query."""
+    if config.FRESH:
+        return ""
     parts = []
     recent = recent_context()
     if recent:
@@ -161,6 +167,8 @@ class SessionLog:
             return "Listener asked: " + "; ".join(asks[:4]) if asks else ""
 
     def end(self, resume_pos: PlaybackPosition | None = None) -> None:
+        if config.FRESH:
+            return  # fresh session: persist nothing (memory/history left untouched)
         if not self.turns and resume_pos is None:
             return
         self._write_transcript()

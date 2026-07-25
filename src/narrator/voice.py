@@ -428,6 +428,9 @@ class DeepgramTTS:
         if not paudio.available():
             return False
         sink = paudio.PcmSink(self.sr, 1)
+        # Lead-in silence (~150ms) so pacat's stream is ramped up before the first
+        # word — kills the audible "dip"/pop at the start of each spoken reply.
+        sink.write(b"\x00" * (int(self.sr * 0.15) * 2))
         try:
             with requests.post(self._url(), json={"text": text},
                                headers={**self._auth, "Content-Type": "application/json"},
@@ -527,8 +530,14 @@ class DeepgramStream:
                     continue
                 alt = (d.get("channel", {}).get("alternatives") or [{}])[0]
                 tr = (alt.get("transcript") or "").strip()
-                if tr and d.get("is_final"):
+                if not tr:
+                    continue
+                if d.get("is_final"):
                     self._q.put({"type": "transcript", "text": tr, "final": bool(d.get("speech_final"))})
+                else:
+                    # interim words = "still talking" — used by the app to hold the
+                    # turn open (silence debounce) so a mid-thought pause isn't cut off.
+                    self._q.put({"type": "interim"})
             self._dead.set()
 
         for fn in (sender, reader):

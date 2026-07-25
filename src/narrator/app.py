@@ -316,6 +316,7 @@ class NarratorApp:
 
         REWIND_SEC = 2.0
         IDLE_RESUME_SEC = 18.0
+        FINALIZE_SILENCE = config.WAKE_SILENCE_SEC   # speak only after this much quiet
         state = "PLAYING"
         pending: list[str] = []
         last_activity = time.time()
@@ -324,21 +325,34 @@ class NarratorApp:
             nonlocal state, pending, last_activity
             text = " ".join(pending).strip()
             pending = []
+            last_activity = time.time()
             if not text:
                 return
             print(f"  you> {text}")
-            last_activity = time.time()
-            if control.matches_keyword(text, config.RESUME_WORDS):
+            # A tiny fragment with no actionable content (a cut-off) -> ask to repeat,
+            # rather than guess. Skipped when a spoiler warning is pending (so a bare
+            # "yes"/"no" still resolves it).
+            if (self.session and self.session.pending_spoiler is None
+                    and _looks_unclear(text)):
+                self.speak("Sorry, I didn't catch that — could you say it again?")
+                last_activity = time.time()
+                return
+            if control.is_resume_command(text, config.RESUME_WORDS):
                 self.speak("Okay.")
                 time.sleep(_RESUME_PAUSE_SEC)
                 self._resume_wake()
                 state = "PLAYING"
+                last_activity = time.time()
                 return
             resp, note = self.session.handle(text)
             tag = "  [spoiler revealed]" if resp.spoiler_used else ""
             self.speak(resp.speech_text + tag)
             if note:
-                print(f"   {note}  →  resume now {self._pos_str(self.session.pos)}")
+                # a navigation command means "take me there and keep playing"
+                print(f"   {note}")
+                time.sleep(_RESUME_PAUSE_SEC)
+                self._resume_wake()
+                state = "PLAYING"
             last_activity = time.time()
 
         while not quit_evt.is_set():
@@ -360,31 +374,31 @@ class NarratorApp:
                     if self.session.memory_context:
                         print("   (remembering earlier sessions)")
                     rest = _strip_wake(ev["text"])  # a question said in the same breath
-                    self.speak("Yes?")
-                    state, pending, last_activity = "CONVERSING", [], time.time()
-                    if rest:
-                        pending = [rest]
-                        finalize_turn()
+                    state, pending = "CONVERSING", ([rest] if rest else [])
+                    if not rest:
+                        self.speak("Yes?")
+                    last_activity = time.time()  # start the silence timer after "Yes?"
                 continue
 
-            # CONVERSING
-            if ev is None:
-                if not pending and time.time() - last_activity > IDLE_RESUME_SEC:
-                    self.speak("Okay, back to the story.")
-                    time.sleep(_RESUME_PAUSE_SEC)
-                    self._resume_wake()
-                    state = "PLAYING"
-                continue
-            if ev["type"] == "speech_started":
+            # CONVERSING — accumulate speech; any activity (even interim words) resets
+            # the silence timer, so we only answer after FINALIZE_SILENCE of quiet.
+            if ev is not None:
+                if ev["type"] in ("speech_started", "interim"):
+                    last_activity = time.time()
+                elif ev["type"] == "transcript":
+                    pending.append(ev["text"])
+                    last_activity = time.time()
+                # utterance_end is ignored on purpose — the silence debounce decides.
+
+            quiet = time.time() - last_activity
+            if pending and quiet >= FINALIZE_SILENCE:
+                finalize_turn()
+            elif not pending and quiet > IDLE_RESUME_SEC:
+                self.speak("Okay, back to the story.")
+                time.sleep(_RESUME_PAUSE_SEC)
+                self._resume_wake()
+                state = "PLAYING"
                 last_activity = time.time()
-            elif ev["type"] == "transcript":
-                pending.append(ev["text"])
-                last_activity = time.time()
-                if ev.get("final"):
-                    finalize_turn()
-            elif ev["type"] == "utterance_end":
-                if pending:
-                    finalize_turn()
 
         stream.stop()
         if self.session:
@@ -439,6 +453,24 @@ def _strip_wake(text: str) -> str:
     return t if len(t) >= 3 else ""
 
 
+_UNCLEAR_KEEP = (
+    "recap", "remind", "summar", "where", "skip", "next", "chapter", "help",
+    "continue", "resume", "restart", "start", "go", "play", "meaning", "explain",
+    "yes", "no", "yeah", "nope", "sure", "okay", "ok",
+)
+
+
+def _looks_unclear(text: str) -> bool:
+    """True for a tiny fragment that carries no actionable content (a cut-off like
+    'can you' / 'who is'), so wake mode can ask the listener to repeat instead of
+    guessing. Anything with 3+ words, or any recognized command/answer word, passes."""
+    words = text.split()
+    if len(words) >= 3:
+        return False
+    low = " ".join(text.lower().split())
+    return not any(k in low for k in _UNCLEAR_KEEP)
+
+
 def _make_voice_speak():
     from . import voice
 
@@ -467,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="hands-free voice: ENTER to talk, ENTER to resume, q to quit")
     ap.add_argument("--wake", action="store_true",
                     help="zero-key wake word: say 'Hey Narrator' / 'Ok continue story' (cloud + headphones)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start with zero prior memory/history and don't persist this session (non-destructive)")
     ap.add_argument("--demo", action="store_true", help="run the scripted demo")
     ap.add_argument("--text", action="store_true", help="drive live by typing")
     ap.add_argument("--voice", action="store_true", help="push-to-talk voice (legacy)")
@@ -477,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     from . import config
+
+    if args.fresh:
+        config.FRESH = True
+        print("[fresh session: ignoring prior memory/history; nothing will be saved]")
 
     manifest = corpus.load_manifest()
     if not llm.is_up() or not llm.model_available():
