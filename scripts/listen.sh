@@ -13,8 +13,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VOICE_PY="${NARRATOR_VOICE_PYTHON:-/home/x0zby2/projects/audiobook-gen/.venv/bin/python}"
-# Brain defaults to 7B (fast). For the 14B upgrade, run:
-#   NARRATOR_LLM=qwen2.5:14b-instruct ./scripts/listen.sh
+# Backend defaults to CLOUD: OpenAI gpt-5.4-mini (brain) + Deepgram (voice).
+# API keys load automatically from ./.env. To run fully local instead:
+#   NARRATOR_BACKEND=local ./scripts/listen.sh
+BACKEND="${NARRATOR_BACKEND:-cloud}"
 
 # Ensure the manifest exists (auto-build if missing).
 if [ ! -f "$ROOT/data/book_manifest.json" ]; then
@@ -22,6 +24,12 @@ if [ ! -f "$ROOT/data/book_manifest.json" ]; then
   (cd "$ROOT/src" && "$VOICE_PY" -m narrator.corpus)
 fi
 
-source "$ROOT/scripts/_ensure_ollama.sh"; ensure_ollama "$ROOT"
+# Ollama is required only for LOCAL backend; for CLOUD it's used (best-effort) just
+# for semantic-memory embeddings, so never block the demo on it.
+if [ "$BACKEND" = "local" ]; then
+  source "$ROOT/scripts/_ensure_ollama.sh"; ensure_ollama "$ROOT"
+else
+  source "$ROOT/scripts/_ensure_ollama.sh"; ensure_ollama "$ROOT" || true
+fi
 cd "$ROOT/src"
 exec "$VOICE_PY" -m narrator.app --listen "$@"

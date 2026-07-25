@@ -36,6 +36,51 @@ def classify_phrase(text: str) -> str | None:
     return None
 
 
+# ── keyword-based wake detection (for --wake streaming) ────────────────────────
+# STT reliably transcribes the distinctive content word but drops short leading
+# words ("hey" -> "a"), so we match the KEYWORD (with a 1-edit fuzz), not the phrase.
+def _norm(text: str) -> str:
+    return "".join(c if c.isalnum() or c == " " else " " for c in text.lower()).split()
+
+
+def _lev1(a: str, b: str) -> bool:
+    """True if edit distance(a, b) <= 1 (cheap, tolerates one STT slip)."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:  # one substitution
+        return sum(x != y for x, y in zip(a, b)) == 1
+    # one insertion/deletion
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1; j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True; j += 1
+    return True
+
+
+def matches_keyword(text: str, words) -> bool:
+    """True if any trigger word appears in `text` (substring or a 1-edit token match)."""
+    toks = _norm(text)
+    joined = " ".join(toks)
+    for w in words:
+        if not w:
+            continue
+        if w in joined:                       # multi-word or exact substring
+            return True
+        if any(_lev1(tok, w) for tok in toks):  # single dropped/slipped word
+            return True
+    return False
+
+
 @dataclass
 class Event:
     kind: str

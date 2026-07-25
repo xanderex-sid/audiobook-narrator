@@ -126,6 +126,19 @@ class STT:
                 words.append((w.word, float(w.start), float(w.end)))
         return words
 
+    def listen(self, should_stop=None, on_start=None) -> tuple[str, bool]:
+        """Capture one utterance from the mic and transcribe it (local VAD).
+
+        Backend-agnostic entry point used by the hands-free loop. Returns
+        (text, ok); ok=False for silence / a rejected hallucination (WS-7).
+        """
+        from . import paudio
+
+        audio = paudio.record_utterance(should_stop=should_stop, on_start=on_start)
+        if should_stop is not None and should_stop():
+            return "", False
+        return self.transcribe_checked(audio)
+
 
 # ── TTS ──────────────────────────────────────────────────────────────────────
 class TTS:
@@ -174,6 +187,387 @@ class TTS:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         sf.write(str(path), audio, sr)
         return Path(path)
+
+
+# ── Deepgram cloud providers (streaming STT + streaming TTS) ──────────────────
+_DG_STT_WS = "wss://api.deepgram.com/v1/listen"
+_DG_STT_HTTP = "https://api.deepgram.com/v1/listen"
+_DG_TTS_HTTP = "https://api.deepgram.com/v1/speak"
+
+
+def _keyterms() -> str:
+    """`&keyterm=` query fragment boosting the wake/resume words (Nova-3 feature)."""
+    import urllib.parse
+
+    terms = list(dict.fromkeys(config.WAKE_WORDS + config.RESUME_WORDS))
+    return "".join(f"&keyterm={urllib.parse.quote(t)}" for t in terms if t)
+
+
+def _pcm16_wav_bytes(audio, sr: int) -> bytes:
+    """Pack a float32 mono array into an in-memory 16-bit PCM wav."""
+    import io
+    import wave
+
+    import numpy as np
+
+    pcm = (np.clip(np.asarray(audio, dtype="float32"), -1.0, 1.0) * 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+class DeepgramSTT:
+    """Deepgram Nova STT. `listen()` streams live over a websocket; the buffered
+    `transcribe*` paths use the prerecorded API (for --voice and alignment)."""
+
+    _SR = 16000
+
+    def __init__(self):
+        self._auth = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
+
+    # -- prerecorded (buffered) --------------------------------------------------
+    def _listen_bytes(self, data: bytes, content_type: str, words: bool = False) -> dict:
+        import requests
+
+        params = {
+            "model": config.DEEPGRAM_STT_MODEL,
+            "smart_format": "true",
+            "punctuate": "true",
+            "language": "en",
+        }
+        r = requests.post(
+            _DG_STT_HTTP, params=params, data=data,
+            headers={**self._auth, "Content-Type": content_type}, timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def _best(j: dict) -> dict:
+        try:
+            return j["results"]["channels"][0]["alternatives"][0]
+        except (KeyError, IndexError):
+            return {}
+
+    def transcribe(self, audio) -> str:
+        text, _ok = self.transcribe_checked(audio)
+        return text
+
+    def transcribe_checked(self, audio) -> tuple[str, bool]:
+        import numpy as np
+
+        if isinstance(audio, (str, Path)):
+            data, ct = Path(audio).read_bytes(), "audio/wav"
+        else:
+            arr = np.asarray(audio, dtype="float32")
+            if arr.size < 1600 or float(np.sqrt(np.mean(arr ** 2))) < 0.006:
+                return "", False  # near-silence (WS-7)
+            data, ct = _pcm16_wav_bytes(arr, self._SR), "audio/wav"
+        try:
+            alt = self._best(self._listen_bytes(data, ct))
+        except Exception:
+            return "", False
+        text = (alt.get("transcript") or "").strip()
+        return self._filter(text, alt.get("confidence"))
+
+    def transcribe_words(self, wav_path) -> list[tuple[str, float, float]]:
+        """Word-level timestamps for forced alignment (WS-4)."""
+        try:
+            alt = self._best(self._listen_bytes(Path(wav_path).read_bytes(), "audio/wav", words=True))
+        except Exception:
+            return []
+        return [(w.get("word", ""), float(w.get("start", 0.0)), float(w.get("end", 0.0)))
+                for w in (alt.get("words") or [])]
+
+    @staticmethod
+    def _filter(text: str, confidence) -> tuple[str, bool]:
+        if not text:
+            return "", False
+        low = text.lower().strip()
+        if low in _HALLUCINATIONS and (confidence is not None and confidence < 0.5):
+            return "", False
+        return text, True
+
+    # -- streaming (live websocket) ---------------------------------------------
+    def listen(self, should_stop=None, on_start=None) -> tuple[str, bool]:
+        """Stream mic audio to Deepgram live and return the final transcript.
+
+        Deepgram's own endpointing/VAD marks end-of-utterance, so this returns as
+        soon as you stop talking. A keypress (should_stop) aborts immediately and
+        falls through to whatever was heard. Falls back to the buffered path if the
+        socket can't be opened.
+        """
+        import json as _json
+        import threading
+
+        from . import paudio
+
+        try:
+            from websockets.sync.client import connect
+        except Exception:
+            audio = paudio.record_utterance(should_stop=should_stop, on_start=on_start)
+            return self.transcribe_checked(audio)
+
+        # interim_results MUST be true for utterance_end_ms/vad endpointing. We still
+        # only accumulate final (is_final) transcripts below, so interims are ignored.
+        params = (
+            f"model={config.DEEPGRAM_STT_MODEL}&encoding=linear16&sample_rate={self._SR}"
+            "&channels=1&language=en&punctuate=true&smart_format=true"
+            "&interim_results=true&vad_events=true&endpointing=300&utterance_end_ms=1000"
+        )
+        try:
+            ws = connect(f"{_DG_STT_WS}?{params}", additional_headers=self._auth,
+                         open_timeout=8, close_timeout=2)
+        except Exception:
+            audio = paudio.record_utterance(should_stop=should_stop, on_start=on_start)
+            return self.transcribe_checked(audio)
+
+        parts: list[str] = []
+        done = threading.Event()
+        started = threading.Event()
+
+        def _stop() -> bool:
+            return done.is_set() or (should_stop is not None and should_stop())
+
+        def sender():
+            for frame in paudio.mic_frames(should_stop=_stop):
+                try:
+                    ws.send(frame)
+                except Exception:
+                    break
+            try:
+                ws.send(_json.dumps({"type": "CloseStream"}))
+            except Exception:
+                pass
+
+        t = threading.Thread(target=sender, daemon=True)
+        t.start()
+        try:
+            while not (should_stop is not None and should_stop()):
+                try:
+                    msg = ws.recv(timeout=0.3)
+                except TimeoutError:
+                    if done.is_set():
+                        break
+                    continue
+                except Exception:
+                    break
+                try:
+                    d = _json.loads(msg)
+                except Exception:
+                    continue
+                typ = d.get("type")
+                if typ == "SpeechStarted":
+                    if on_start is not None and not started.is_set():
+                        started.set()
+                        on_start()
+                    continue
+                if typ == "UtteranceEnd":
+                    done.set()
+                    break
+                alt = (d.get("channel", {}).get("alternatives") or [{}])[0]
+                tr = (alt.get("transcript") or "").strip()
+                if tr and d.get("is_final"):
+                    parts.append(tr)
+                    if d.get("speech_final"):
+                        done.set()
+                        break
+        finally:
+            done.set()
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if should_stop is not None and should_stop():
+            return "", False
+        return self._filter(" ".join(p for p in parts if p).strip(), None)
+
+
+class DeepgramTTS:
+    """Deepgram Aura TTS. `stream_speak()` plays audio progressively as it streams."""
+
+    def __init__(self):
+        self.sr = 24000
+        self._auth = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
+
+    def _url(self) -> str:
+        return (f"{_DG_TTS_HTTP}?model={config.DEEPGRAM_TTS_MODEL}"
+                f"&encoding=linear16&sample_rate={self.sr}")
+
+    def synth(self, text: str):
+        """Return (float32 mono numpy audio, sample_rate)."""
+        import numpy as np
+        import requests
+
+        r = requests.post(self._url(), json={"text": text},
+                          headers={**self._auth, "Content-Type": "application/json"}, timeout=60)
+        r.raise_for_status()
+        pcm = np.frombuffer(r.content, dtype="<i2").astype("float32") / 32768.0
+        return pcm, self.sr
+
+    def to_wav(self, text: str, path: str | Path) -> Path:
+        import soundfile as sf
+
+        audio, sr = self.synth(text)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(path), audio, sr)
+        return Path(path)
+
+    def stream_speak(self, text: str) -> bool:
+        """Synthesize and play progressively — first audio without waiting for the
+        whole clip. Returns True if it played."""
+        import requests
+
+        from . import paudio
+
+        if not paudio.available():
+            return False
+        sink = paudio.PcmSink(self.sr, 1)
+        try:
+            with requests.post(self._url(), json={"text": text},
+                               headers={**self._auth, "Content-Type": "application/json"},
+                               stream=True, timeout=60) as r:
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=4096):
+                    if chunk:
+                        sink.write(chunk)
+        except Exception:
+            sink.close()
+            return False
+        sink.close()
+        return True
+
+
+class DeepgramStream:
+    """A persistent Deepgram live-STT stream for hands-free WAKE mode.
+
+    Unlike `DeepgramSTT.listen()` (one utterance), this keeps a single socket open
+    for the whole session, continuously pumping the mic, and exposes an event queue:
+
+        {"type": "transcript",   "text": <final text>, "final": <speech_final?>}
+        {"type": "utterance_end"}
+        {"type": "speech_started"}
+
+    The caller runs the PLAYING<->CONVERSING state machine off these events —
+    matching the wake phrase while the book plays, then the question + continue
+    phrase while conversing. Headphones assumed (mic never hears the book/TTS).
+    """
+
+    _SR = 16000
+
+    def __init__(self):
+        self._auth = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
+        self._ws = None
+        self._q = None
+        self._stop = None
+        self._dead = None
+
+    def start(self) -> bool:
+        import queue
+        import threading
+
+        from . import paudio
+
+        try:
+            from websockets.sync.client import connect
+        except Exception:
+            return False
+
+        params = (
+            f"model={config.DEEPGRAM_STT_MODEL}&encoding=linear16&sample_rate={self._SR}"
+            "&channels=1&language=en&punctuate=true&smart_format=true"
+            "&interim_results=true&vad_events=true&endpointing=300&utterance_end_ms=1000"
+        )
+        params += _keyterms()  # boost the wake/resume words so STT hears them reliably
+        try:
+            self._ws = connect(f"{_DG_STT_WS}?{params}", additional_headers=self._auth,
+                               open_timeout=8, close_timeout=2)
+        except Exception:
+            self._ws = None
+            return False
+
+        self._q = queue.Queue()
+        self._stop = threading.Event()
+        self._dead = threading.Event()
+
+        def sender():
+            for frame in paudio.mic_frames(should_stop=self._stop.is_set):
+                if self._stop.is_set():
+                    break
+                try:
+                    self._ws.send(frame)
+                except Exception:
+                    break
+
+        def reader():
+            import json as _json
+
+            while not self._stop.is_set():
+                try:
+                    msg = self._ws.recv(timeout=0.3)
+                except TimeoutError:
+                    continue
+                except Exception:
+                    break
+                try:
+                    d = _json.loads(msg)
+                except Exception:
+                    continue
+                typ = d.get("type")
+                if typ == "UtteranceEnd":
+                    self._q.put({"type": "utterance_end"})
+                    continue
+                if typ == "SpeechStarted":
+                    self._q.put({"type": "speech_started"})
+                    continue
+                alt = (d.get("channel", {}).get("alternatives") or [{}])[0]
+                tr = (alt.get("transcript") or "").strip()
+                if tr and d.get("is_final"):
+                    self._q.put({"type": "transcript", "text": tr, "final": bool(d.get("speech_final"))})
+            self._dead.set()
+
+        for fn in (sender, reader):
+            threading.Thread(target=fn, daemon=True).start()
+        return True
+
+    def get(self, timeout: float = 0.2):
+        import queue
+
+        if self._q is None:
+            return None
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def alive(self) -> bool:
+        return self._ws is not None and self._dead is not None and not self._dead.is_set()
+
+    def stop(self):
+        if self._stop:
+            self._stop.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+        self._ws = None
+
+
+# ── provider factories (backend-selected) ─────────────────────────────────────
+def make_stt():
+    """STT provider for the active backend (Deepgram cloud or faster-whisper local)."""
+    return DeepgramSTT() if config.BACKEND == "cloud" else STT()
+
+
+def make_tts():
+    """TTS provider for the active backend (Deepgram Aura cloud or Kokoro local)."""
+    return DeepgramTTS() if config.BACKEND == "cloud" else TTS()
 
 
 # ── live audio (optional; needs sounddevice + PortAudio) ─────────────────────

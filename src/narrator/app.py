@@ -240,13 +240,12 @@ class NarratorApp:
                 continue
 
             print("   🎙️  listening…", flush=True)
-            audio = paudio.record_utterance(
+            text, ok = stt.listen(
                 should_stop=lambda: enter_evt.is_set() or quit_evt.is_set(),
                 on_start=lambda: print("   …hearing you", flush=True),
             )
             if enter_evt.is_set() or quit_evt.is_set():
                 continue  # ENTER pressed mid-listen -> loop back, will resume
-            text, ok = stt.transcribe_checked(audio)
             if not ok or not text:
                 continue  # silence / hallucination -> just keep listening (WS-7)
             print(f"  you> {text}")
@@ -269,6 +268,141 @@ class NarratorApp:
         self.player.resume()
         print(f"▶  resumed at {self._pos_str(self.player.position())} — ENTER to talk again")
 
+    # ── fully hands-free WAKE loop (cloud streaming; headphones) ───────────────
+    def run_wake(self, stt, tts):
+        """Zero-key voice control (WS-1 / your wake-word request).
+
+        A single Deepgram stream stays open the whole session:
+          PLAYING     — say "Hey Narrator" -> pause (rewind ~2s) and start talking.
+          CONVERSING  — just speak; each utterance is answered. Say "Ok continue
+                        story" (or fall silent a while) -> resume the book.
+        Only `q`+ENTER quits. Requires headphones (so the mic never hears the book
+        or the narrator's own voice) and the cloud backend (Deepgram).
+        """
+        import threading
+
+        from . import config, paudio, voice
+
+        if not paudio.available():
+            print("! No PulseAudio device — falling back to 2-ENTER mode.")
+            self.run_handsfree(stt, tts)
+            return
+
+        stream = voice.DeepgramStream()
+        if not stream.start():
+            print("! Couldn't open the Deepgram live stream — falling back to 2-ENTER mode.")
+            self.run_handsfree(stt, tts)
+            return
+
+        quit_evt = threading.Event()
+
+        def watch_stdin():
+            while not quit_evt.is_set():
+                try:
+                    line = input()
+                except (EOFError, KeyboardInterrupt):
+                    quit_evt.set()
+                    return
+                if line.strip().lower() in ("q", "quit", "exit"):
+                    quit_evt.set()
+                    return
+
+        threading.Thread(target=watch_stdin, daemon=True).start()
+
+        wake_word = (config.WAKE_WORDS[0].title() if config.WAKE_WORDS else "the wake word")
+        self.player.play()
+        print(f"\n▶  playing — {self._pos_str(self.player.position())}")
+        print(f"   🎧 Headphones on. Say “{wake_word}” to interrupt · “Ok continue story” to resume · q ENTER to quit\n")
+
+        REWIND_SEC = 2.0
+        IDLE_RESUME_SEC = 18.0
+        state = "PLAYING"
+        pending: list[str] = []
+        last_activity = time.time()
+
+        def finalize_turn() -> None:
+            nonlocal state, pending, last_activity
+            text = " ".join(pending).strip()
+            pending = []
+            if not text:
+                return
+            print(f"  you> {text}")
+            last_activity = time.time()
+            if control.matches_keyword(text, config.RESUME_WORDS):
+                self.speak("Okay.")
+                time.sleep(_RESUME_PAUSE_SEC)
+                self._resume_wake()
+                state = "PLAYING"
+                return
+            resp, note = self.session.handle(text)
+            tag = "  [spoiler revealed]" if resp.spoiler_used else ""
+            self.speak(resp.speech_text + tag)
+            if note:
+                print(f"   {note}  →  resume now {self._pos_str(self.session.pos)}")
+            last_activity = time.time()
+
+        while not quit_evt.is_set():
+            if not stream.alive():  # best-effort reconnect if the socket dropped
+                stream.stop()
+                stream = voice.DeepgramStream()
+                if not stream.start():
+                    time.sleep(1.0)
+                    continue
+
+            ev = stream.get(timeout=0.2)
+
+            if state == "PLAYING":
+                if ev and ev["type"] == "transcript" and control.matches_keyword(ev["text"], config.WAKE_WORDS):
+                    pos = self.player.pause()
+                    back = PlaybackPosition(pos.chapter_index, max(0.0, pos.position_sec - REWIND_SEC))
+                    self.session = NarratorSession(self.manifest, back)
+                    print(f"\n⏸  “{wake_word}” — paused at {self._pos_str(back)} (speak; say “Ok continue story” to resume)")
+                    if self.session.memory_context:
+                        print("   (remembering earlier sessions)")
+                    rest = _strip_wake(ev["text"])  # a question said in the same breath
+                    self.speak("Yes?")
+                    state, pending, last_activity = "CONVERSING", [], time.time()
+                    if rest:
+                        pending = [rest]
+                        finalize_turn()
+                continue
+
+            # CONVERSING
+            if ev is None:
+                if not pending and time.time() - last_activity > IDLE_RESUME_SEC:
+                    self.speak("Okay, back to the story.")
+                    time.sleep(_RESUME_PAUSE_SEC)
+                    self._resume_wake()
+                    state = "PLAYING"
+                continue
+            if ev["type"] == "speech_started":
+                last_activity = time.time()
+            elif ev["type"] == "transcript":
+                pending.append(ev["text"])
+                last_activity = time.time()
+                if ev.get("final"):
+                    finalize_turn()
+            elif ev["type"] == "utterance_end":
+                if pending:
+                    finalize_turn()
+
+        stream.stop()
+        if self.session:
+            self.session.end()
+        self.player.pause()
+        print("\n■  stopped. Progress and notes saved.")
+
+    def _resume_wake(self):
+        from . import config
+
+        wake_word = (config.WAKE_WORDS[0].title() if config.WAKE_WORDS else "the wake word")
+        resume_pos = self.session.pos
+        self.session.end()
+        self.session = None
+        self.player.seek_to(resume_pos)
+        self.player.resume()
+        print(f"▶  resumed at {self._pos_str(self.player.position())} — say “{wake_word}” to talk again")
+
 
 # ── scripted demo (verifiable, no hardware) ──────────────────────────────────
 def _demo(manifest) -> int:
@@ -290,13 +424,35 @@ def _demo(manifest) -> int:
     return 0
 
 
+def _strip_wake(text: str) -> str:
+    """Return anything the listener said AFTER the wake word (a same-breath question)."""
+    import re
+
+    from . import config
+
+    t = text
+    # strip common wake lead-ins and the configured wake words themselves
+    for p in ("hey narrator", "hey, narrator", "hi narrator", "ok narrator", "hey there",
+              "hey", "hi", "okay", "ok") + tuple(config.WAKE_WORDS):
+        t = re.sub(rf"\b{re.escape(p)}\b", "", t, flags=re.IGNORECASE)
+    t = t.strip(" ,.-—?!")
+    return t if len(t) >= 3 else ""
+
+
 def _make_voice_speak():
     from . import voice
 
-    tts = voice.TTS()
+    tts = voice.make_tts()
+    stream = getattr(tts, "stream_speak", None)  # cloud TTS speaks progressively
 
     def speak(text: str):
         print(f"  narrator> {text}")
+        if stream is not None:
+            try:
+                if stream(text):
+                    return
+            except Exception:
+                pass
         audio, sr = tts.synth(text)
         voice.play(audio, sr)
 
@@ -309,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Audiobook Narrator — full loop")
     ap.add_argument("--listen", action="store_true",
                     help="hands-free voice: ENTER to talk, ENTER to resume, q to quit")
+    ap.add_argument("--wake", action="store_true",
+                    help="zero-key wake word: say 'Hey Narrator' / 'Ok continue story' (cloud + headphones)")
     ap.add_argument("--demo", action="store_true", help="run the scripted demo")
     ap.add_argument("--text", action="store_true", help="drive live by typing")
     ap.add_argument("--voice", action="store_true", help="push-to-talk voice (legacy)")
@@ -318,10 +476,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-audio", action="store_true", help="don't open a speaker device")
     args = ap.parse_args(argv)
 
+    from . import config
+
     manifest = corpus.load_manifest()
     if not llm.is_up() or not llm.model_available():
-        print("! Local LLM not ready — run scripts/serve.sh and pull the model.")
+        if config.BACKEND == "cloud":
+            print("! OpenAI not ready — set OPENAI_API_KEY in .env (backend=cloud).")
+        else:
+            print("! Local LLM not ready — run scripts/serve.sh and pull the model.")
         return 2
+    if config.BACKEND == "cloud" and not config.DEEPGRAM_API_KEY and (args.listen or args.voice):
+        print("! DEEPGRAM_API_KEY missing in .env — needed for cloud voice.")
+        return 2
+    print(f"[backend: {config.BACKEND}  ·  brain: {config.LLM_MODEL}"
+          + (f"  ·  voice: Deepgram {config.DEEPGRAM_STT_MODEL}/{config.DEEPGRAM_TTS_MODEL}]"
+             if config.BACKEND == "cloud" else "  ·  voice: whisper/Kokoro (local)]"))
 
     if args.demo:
         return _demo(manifest)
@@ -337,18 +506,29 @@ def main(argv: list[str] | None = None) -> int:
     else:
         start = PlaybackPosition(1, 0.0)   # from the beginning
 
+    if args.wake:
+        from . import voice
+
+        if config.BACKEND != "cloud":
+            print("--wake needs the cloud backend (Deepgram streaming). "
+                  "Run with NARRATOR_BACKEND=cloud, or use --listen for the local 2-ENTER mode.")
+            return 2
+        app = NarratorApp(manifest, start, speak=_make_voice_speak(), audio=not args.no_audio)
+        app.run_wake(voice.make_stt(), voice.make_tts())
+        return 0
+
     if args.listen:
         from . import voice
 
         app = NarratorApp(manifest, start, speak=_make_voice_speak(), audio=not args.no_audio)
-        app.run_handsfree(voice.STT(), voice.TTS())
+        app.run_handsfree(voice.make_stt(), voice.make_tts())
         return 0
 
     if args.voice:
         from . import voice
 
         app = NarratorApp(manifest, start, speak=_make_voice_speak(), audio=not args.no_audio)
-        app.run_voice(voice.STT())
+        app.run_voice(voice.make_stt())
         return 0
 
     # default: text-driven live loop

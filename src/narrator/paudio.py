@@ -101,6 +101,69 @@ class BookStream:
         self._proc = None
 
 
+# ── streaming sink: progressive linear16 playback (cloud TTS) ────────────────
+class PcmSink:
+    """Play raw little-endian PCM as it arrives by piping into pacat.
+
+    Lets streamed TTS start speaking before the whole clip is synthesized:
+    write() bytes as they come off the wire, close() to drain and finish.
+    """
+
+    def __init__(self, sample_rate: int = 24000, channels: int = 1):
+        self._proc = subprocess.Popen(
+            [PACAT, "--format=s16le", f"--rate={sample_rate}", f"--channels={channels}"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
+    def write(self, data: bytes) -> None:
+        if not data or self._proc.stdin is None:
+            return
+        try:
+            self._proc.stdin.write(data)
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def close(self) -> None:
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            self._proc.wait(timeout=15)
+        except Exception:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+
+# ── streaming mic frames (cloud STT) ──────────────────────────────────────────
+def mic_frames(should_stop=None, frame_ms: int = 50):
+    """Yield raw s16le 16k mono frames from the mic until should_stop() is True.
+
+    Feeds Deepgram's live STT socket; endpointing/VAD there decides when the
+    utterance ends, so this just pumps audio and bails promptly on a keypress.
+    """
+    sr = 16000
+    chunk = int(sr * frame_ms / 1000)
+    bytes_per = chunk * 2
+    proc = subprocess.Popen(
+        [PAREC, "--format=s16le", f"--rate={sr}", "--channels=1", "--latency-msec=30"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        while True:
+            if should_stop is not None and should_stop():
+                break
+            buf = proc.stdout.read(bytes_per)
+            if not buf or len(buf) < bytes_per:
+                break
+            yield buf
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 # ── press-to-stop recording (reliable; no VAD guessing) ──────────────────────
 def start_recording(path: str | Path) -> "subprocess.Popen":
     return subprocess.Popen(

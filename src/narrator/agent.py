@@ -427,16 +427,30 @@ def respond(
         speech = _answer_full(title, query, knowledge.full_context(manifest))
         return AgentResponse(speech or "Here's what happens...", tool="reveal_spoiler", spoiler_used=True)
 
-    # Answer strictly from heard text (temp 0), then apply the layered spoiler gate.
-    speech = _answer_heard(title, chapter_title, query, heard, memory_context)
+    # Everything heard -> nothing to spoil; a single heard-only answer suffices.
     if not cutoff.unheard_exists:
-        # everything has been heard -> nothing left to spoil
+        speech = _answer_heard(title, chapter_title, query, heard, memory_context)
         if _is_need(speech):
             return AgentResponse("Hmm — I don't think that's in the story.", tool="answer_about_story")
         return AgentResponse(speech, tool="answer_about_story")
 
-    target = _target_chapter(title, query, knowledge.full_context(manifest))
-    if _is_spoiler(query, speech, heard, cutoff.chapter_index, target):
+    # Unheard content exists: the heard-only answer and BOTH spoiler signals
+    # (target-chapter + heard-only gate) are independent, so run them concurrently
+    # instead of in series — one round-trip of latency instead of three.
+    from concurrent.futures import ThreadPoolExecutor
+
+    full = knowledge.full_context(manifest)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_ans = ex.submit(_answer_heard, title, chapter_title, query, heard, memory_context)
+        f_tgt = ex.submit(_target_chapter, title, query, full)
+        f_gate = ex.submit(_gate_spoiler, query, heard)
+        speech, target, gated = f_ans.result(), f_tgt.result(), f_gate.result()
+
+    # UNION of the three structurally-leak-proof signals (see _is_spoiler).
+    is_spoiler = (_is_need(speech)
+                  or (target is not None and target > cutoff.chapter_index)
+                  or gated)
+    if is_spoiler:
         return AgentResponse(_warn(manifest, target), intent="spoiler", tool="answer_about_story",
                              needs_confirmation=True, pending_spoiler={"query": query})
     return AgentResponse(speech, tool="answer_about_story")

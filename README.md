@@ -5,16 +5,31 @@ A **fully local, free** voice companion for an audiobook. Listen to the book; sa
 are we", spoilers on demand — then **"Ok Continue Story"** to resume from the right
 spot. Answers are **spoiler-gated** to how far you've actually listened.
 
-No cloud. Everything (LLM, speech models, data) runs on this machine and lives inside
-this project.
+Two interchangeable backends, chosen with `NARRATOR_BACKEND`:
 
-## Stack (all local)
-| Part | What |
-|---|---|
-| Brain | **Qwen2.5-7B-Instruct** via **Ollama** (model store: `models/ollama/`) |
-| Speech-to-text | **faster-whisper** `base.en` (`models/speech/`) |
-| Text-to-speech | **Kokoro-82M** (`models/speech/`) |
-| GPU | NVIDIA RTX 5070 Ti (CUDA) — brain runs on GPU; STT on CPU by default |
+- **`cloud`** (default) — lowest latency: **OpenAI gpt-5.4-mini** brain + **Deepgram**
+  streaming STT/TTS. API keys load automatically from `./.env`.
+- **`local`** — fully offline, free: **Ollama/Qwen2.5** + **faster-whisper** + **Kokoro**.
+  Nothing leaves the machine.
+
+The two layers are swapped behind identical interfaces, so the agent logic, spoiler
+gate, memory, and the 2-ENTER hands-free loop are the same either way.
+
+## Stack
+| Part | Cloud (default) | Local (`NARRATOR_BACKEND=local`) |
+|---|---|---|
+| Brain | **OpenAI gpt-5.4-mini** | **Qwen2.5-7B-Instruct** via Ollama |
+| Speech-to-text | **Deepgram Nova-3** (streaming) | **faster-whisper** `base.en` |
+| Text-to-speech | **Deepgram Aura-2** (streaming) | **Kokoro-82M** |
+| Embeddings (memory) | **nomic-embed-text** (local, both) | **nomic-embed-text** |
+
+> **Cloud keys:** put `OPENAI_API_KEY=...` and `DEEPGRAM_API_KEY=...` in `./.env`
+> (git-ignored). That's all `./scripts/listen.sh` needs in cloud mode. Ollama is only
+> required for the `local` backend (and, best-effort, for semantic memory embeddings).
+>
+> **Latency:** cloud answers run the router, heard-answer, and both spoiler signals
+> **concurrently** (~2–3s to first word); Deepgram streams the answer audio as it
+> synthesizes and returns your transcript ~1s after you stop talking.
 
 > **Not in this repo:** the model weights (`models/`, ~4.9 GB) and the audiobook
 > `.wav` files (`audiobook_chapters/chapters/`, ~112 MB) are **git-ignored**. Clone
@@ -86,6 +101,24 @@ Use **headphones**. Then:
 So exactly **two ENTERs per talking session**, voice-only in between. It auto-starts the
 local LLM and builds the manifest if needed. `./scripts/listen.sh --resume` continues
 where you last stopped instead of the start.
+
+### Zero-key mode — wake word (cloud + headphones)
+```bash
+./scripts/wake.sh            # 🎧 fully hands-free: say "Friday" to interrupt
+```
+Keeps one Deepgram stream open the whole session. Say **"Friday"** → the book pauses
+(rewinds ~2s) and listens; just **speak** your question; say **"Ok continue story"** (or
+fall silent ~18s) → it resumes. Only **q** ENTER quits. **Headphones required** so the
+mic never hears the book or the narrator's own voice — that's what makes wake-word
+interruption reliable without echo cancellation. Cloud backend only; `./scripts/listen.sh`
+(2-ENTER) stays the robust fallback.
+
+Detection matches the **distinctive keyword** (STT reliably hears "Friday" but often drops
+a leading "hey"), with fuzzy tolerance and Deepgram `keyterm` boosting. Change the words
+without touching code:
+```bash
+NARRATOR_WAKE_WORD=jarvis NARRATOR_RESUME_WORD=onward ./scripts/wake.sh
+```
 
 ### Other entry points
 ```bash

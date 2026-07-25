@@ -23,3 +23,7 @@ work.txt
 
 # Inferred listener preferences (regenerated)
 data/preferences/
+
+# API keys (never commit)
+.env
+.env.local

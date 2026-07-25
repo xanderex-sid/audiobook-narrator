@@ -13,3 +13,11 @@
 #   mem0ai              # persistent cross-session memory (refinement)
 #
 # LLM runtime is Ollama (installed to ~/.local, model store in ./models/ollama).
+#
+# CLOUD backend (NARRATOR_BACKEND=cloud, the default) needs NO extra brain deps —
+# the OpenAI + Deepgram REST calls use only urllib (stdlib). The cloud VOICE path
+# (Deepgram streaming) uses, in the voice env:
+#   requests            # Deepgram REST (STT prerecorded, Aura TTS)
+#   websockets          # Deepgram live streaming STT (sync client, >=12)
+# Both are already present in the voice venv. Keys come from ./.env
+# (OPENAI_API_KEY, DEEPGRAM_API_KEY).
