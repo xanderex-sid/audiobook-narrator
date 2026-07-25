@@ -1,0 +1,15 @@
+# Audiobook Narrator — local, free, native stack.
+#
+# Milestone A (text brains): ZERO third-party packages — uses only the Python
+# stdlib plus a local Ollama server (installed separately in ~/.local).
+#
+# Later milestones (voice / playback / wake word) add:
+#   faster-whisper      # STT (reuses Systran/faster-whisper-base.en from HF cache)
+#   kokoro              # TTS  (reuses hexgrad/Kokoro-82M from HF cache)
+#   soundfile           # wav I/O
+#   sounddevice         # mic capture + speaker playback (needs portaudio)
+#   numpy
+#   openwakeword        # "Hey Narrator" wake word (Milestone D refinement)
+#   mem0ai              # persistent cross-session memory (refinement)
+#
+# LLM runtime is Ollama (installed to ~/.local, model store in ./models/ollama).

@@ -1,0 +1,22 @@
+# ── Large model weights (installed locally, see README "Getting the models") ──
+models/
+
+# ── Audiobook audio (large binaries; see README "Getting the audiobook audio") ─
+audiobook_chapters/chapters/*.wav
+
+# ── Python venvs / caches ─────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Runtime data (regenerated) — keep data/book_manifest.json, drop the rest ──
+data/sessions/
+data/*.log
+data/*.wav
+
+# ── Scratch / editor ──────────────────────────────────────────────────────────
+work.txt
+.DS_Store
+*.swp
